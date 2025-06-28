@@ -15,6 +15,7 @@
 #define OSTD_HEADLESS
 #include "One-Std/one-headers/one_system.h"
 #include "One-Std/one-headers/one_string.h"
+#include "One-Std/one-headers/one_print.h"
 
 #define JAC_EXPORT
 
@@ -56,6 +57,8 @@ typedef enum Jac_Result_Code {
 	JAC_RESULT_BAD_IMPLICIT_CONVERSION,
 	JAC_RESULT_NON_STORAGE_USED_AS_STORAGE,
 	JAC_RESULT_CANNOT_OPEN_FILE,
+	
+	JAC_RESULT_INTERNAL_ERROR,
 } Jac_Result_Code;
 
 typedef struct Jac_Result {
@@ -66,8 +69,16 @@ typedef struct Jac_Result {
 	// u64 binary_blob_size;
 } Jac_Result;
 
+typedef enum Jac_Inline_Mode {
+	JAC_INLINE_NEVER, // Never inline
+	JAC_INLINE_EXPLICIT, // Only inline when explicitly using the inline keyword
+	JAC_INLINE_SMALL_PROCEDURES, // Inline all functions under X lines of code (And explicitly inlined)
+	JAC_INLINE_ALL, // Inline all function calls where possible
+} Jac_Inline_Mode;
+
 typedef struct Jac_Config {
 	string out_file_path;
+	Jac_Inline_Mode inline_mode;
 } Jac_Config;
 
 JAC_EXPORT Jac_Result jac_compile(string first_file_path, Jac_Config config);
@@ -220,10 +231,13 @@ typedef enum Code_Node_Kind {
 	CODE_NODE_NONE,
 	CODE_NODE_SET,
 	CODE_NODE_CALL,
-	CODE_NODE_OP_ADD,
+	CODE_NODE_RETURN,
+	CODE_NODE_OP_FIRST,
+	CODE_NODE_OP_ADD = CODE_NODE_OP_FIRST,
 	CODE_NODE_OP_SUB,
 	CODE_NODE_OP_MUL,
 	CODE_NODE_OP_DIV,
+	CODE_NODE_OP_LAST = CODE_NODE_OP_DIV,
 	CODE_NODE_GET_STRING_SLICE,
 } Code_Node_Kind;
 
@@ -244,9 +258,15 @@ typedef struct Code_Node_Set {
 typedef struct Code_Node_Call {
 	Code_Node base;
 	u64 arg_count;
+	Value dst;
 	string symbol;
 	Value args[];
 } Code_Node_Call;
+typedef struct Code_Node_Return {
+	Code_Node base;
+	u64 count;
+	Value values[];
+} Code_Node_Return;
 
 typedef struct Code_Node_Op {
 	Code_Node base;
@@ -293,6 +313,7 @@ typedef struct Type_Array {
 
 typedef struct Type {
 	string name; // NOT necessarily a slice into source
+	u64 id;
 	u64 size;
 	Type_Kind kind;
 	u32 register_width;
@@ -334,11 +355,17 @@ typedef struct Value_Name {
 	Value value;
 	Type *type;
 	string name;
-	Code_Node_Set *first_set;
+	Code_Node *first_set;
 	u64 read_count;
 	Value_Name_Kind kind;
 } Value_Name;
 
+typedef enum Expression_Flags {
+	EXPRESSION_PROCEDURE_CALL = 1 << 0,
+	EXPRESSION_INLINED_PROCEDURE_CALL = 1 << 1,
+	EXPRESSION_OP = 1 << 2,
+	EXPRESSION_LITERAL = 1 << 3,
+} Expression_Flags;
 typedef struct Expression {
 	Value value;
 	Value_Name *name; // Set if expression was just a value name
@@ -346,6 +373,7 @@ typedef struct Expression {
 	Token t0;
 	Token t1;
 	bool is_storage;
+	u32 flags;
 } Expression;
 
 
@@ -358,12 +386,16 @@ typedef struct Jac_Context {
 	
 	u32 next_vnum;
 		
-	Procedure_Reference  *global_proc_table;
+	Procedure_Reference *global_proc_table;
 	Value_Name *global_value_table;
 	Type       *global_type_table;
 	
+	u64 *global_value_positions;
+	
 	Arena data_segment_arena;
 	u8 *data_segment;
+	
+	u64 next_type_id;
 	
 	Type *type_u8;
 	Type *type_s8;
@@ -393,18 +425,36 @@ typedef struct Token_Context {
 	u64 last_line_start_pos;
 } Token_Context;
 
+typedef enum Compile_Proc_State_Flags {
+	COMPILE_STATE_NONE = 0,
+	COMPILE_STATE_INLINING = 1 << 0,
+} Compile_Proc_State_Flags;
+
 typedef struct Compile_Proc_Context {
 	Jac_Context *ctx;
 	Token_Context *tokenizer;
 	Procedure_Reference *proc_table;
 	Value_Name *value_table;
 	Type *type_table;
-	Code_Node_Set **set_table;
+	Code_Node **set_table; // Contains Node_Set's but also implicit sets like Node_Call
+	
+	u32 *param_vnums;
+	
+	u64 param_count;
 	
 	Arena node_arena;
 	Code_Node *nodes;
 	
+	Arena code_arena;
+	u8 *code;
+	
+	Code_Node **consequential_nodes;
+	
 	Arena dependencies_arena;
+	
+	s32 state_flags;
+	
+	Value inline_return_val;
 	
 } Compile_Proc_Context;
 
@@ -433,17 +483,28 @@ void add_code_dependency(Compile_Proc_Context *compiler, Code_Node *from, Code_N
 	}
 }
 
-void add_code_dependency_on_value_sets(Compile_Proc_Context *compiler, Code_Node_Set *from, Value_Name *name) {
+void add_code_dependency_on_value_sets(Compile_Proc_Context *compiler, Code_Node *from, Value_Name *name) {
 	assert(name->kind == VALUE_NAME_VARIABLE); //@value_storage_evaluation
 				
 	// Add dependency on all previous set to value name
 	// @optimization this will cause false dependencies, emitting code which shouldn't be emitted
 	// Should probably just depend on the latest sets on each branch.
 	for (s64 i = (s64)persistent_array_count(compiler->set_table)-1; i >= 0; i -= 1) {
-		Code_Node_Set *prev_set = compiler->set_table[i];
+		Code_Node *prev_set = compiler->set_table[i];
 		
-		if (prev_set->dst.vnum == from->dst.vnum) {
-			add_code_dependency(compiler, &from->base, &prev_set->base);
+		u32 prev_vnum = 0;
+		if (prev_set->kind == CODE_NODE_SET)
+			prev_vnum = ((Code_Node_Set*) prev_set)->dst.vnum;
+		else if (prev_set->kind == CODE_NODE_CALL)
+			prev_vnum = ((Code_Node_Call*) prev_set)->dst.vnum;
+		else if (prev_set->kind >= CODE_NODE_OP_FIRST && prev_set->kind <= CODE_NODE_OP_FIRST)
+			prev_vnum = ((Code_Node_Op*) prev_set)->dst.vnum;
+		else if (prev_set->kind == CODE_NODE_GET_STRING_SLICE)
+			prev_vnum = ((Code_Node_Get_String_Slice*) prev_set)->dst.vnum;
+		else assert(false);
+		
+		if (prev_vnum == name->value.vnum) {
+			add_code_dependency(compiler, from, prev_set);
 		}
 		
 		if (prev_set == name->first_set) {
@@ -554,6 +615,7 @@ string stringify_result(Jac_Result_Code result) {
 		case JAC_RESULT_BAD_IMPLICIT_CONVERSION: return STR("JAC_RESULT_BAD_IMPLICIT_CONVERSION");
 		case JAC_RESULT_NON_STORAGE_USED_AS_STORAGE: return STR("JAC_RESULT_NON_STORAGE_USED_AS_STORAGE");
 		case JAC_RESULT_CANNOT_OPEN_FILE: return STR("JAC_RESULT_CANNOT_OPEN_FILE");
+		case JAC_RESULT_INTERNAL_ERROR: return STR("JAC_RESULT_INTERNAL_ERROR");
 		
 		default: break;
 	}
@@ -675,6 +737,8 @@ string tprint_tokens(Jac_Context *ctx, Token t0, Token t1, string message) {
         );
     }
 }
+
+#define asserttok(ctx, cond, msg, t0, t1) if (!(cond)) terminate_error(ctx, JAC_RESULT_INTERNAL_ERROR, msg, t0, t1)
 
 void terminate_error(Jac_Context *ctx, Jac_Result_Code result, string message, Token *t0, Token *t1) {
 	assertmsg(result != JAC_RESULT_NONE, "Error: error ¯\\_(ツ)_/¯");
@@ -838,51 +902,6 @@ Token tok_consume(Token_Context *tokenizer) {
 		p += 1;
 		set_source_position(tokenizer, (u64)p - (u64)ctx->source.data);
 		
-		return token;
-	}
-
-	if (is_alpha(*p) || *p == '_') {
-		
-		while (is_alpha(*p) || *p == '_' || is_digit(*p)) {p += 1;}
-		
-		token.text.count = (u64)p - (u64)token.text.data;
-		token.kind = TOKEN_KIND_IDENTIFIER;
-		set_source_position(tokenizer, (u64)p - (u64)ctx->source.data);
-		token.line_num = tokenizer->line_num;
-		token.line_start_pos = tokenizer->last_line_start_pos;
-		return token;
-	}
-	
-	if (is_digit(*p) || (p+1 < end && p[0] == '-' && is_digit(p[1]))) {
-		bool dot = false;
-		bool is_hex = false;
-		bool neg = p[0] == '-';
-		
-		if (neg) p += 1;
-		
-		if (p+2 < ctx->source.data + ctx->source.count && p[0] == '0' && p[1] == 'x' && is_hex_digit(p[2])) {
-			is_hex = true;
-			p += 2;
-		}
-		
-		while (is_digit(*p) || *p == '.' || (is_hex && (*p == 'x' || is_hex_digit(*p)))) {
-			if (*p == '.') {
-				if (!dot && !is_hex) dot = true;
-				else {
-					break;
-				}
-			}
-			p += 1;
-		}
-		if (dot && *(p-1) == '.') {
-			dot = false;
-			p--;
-		}
-		token.text.count = (u64)p - (u64)token.text.data;
-		token.kind = dot ? TOKEN_KIND_FLOAT_LITERAL : TOKEN_KIND_INT_LITERAL;
-		set_source_position(tokenizer, (u64)p - (u64)ctx->source.data);
-		token.line_num = tokenizer->line_num;
-		token.line_start_pos = tokenizer->last_line_start_pos;
 		return token;
 	}
 	
@@ -1056,6 +1075,51 @@ Token tok_consume(Token_Context *tokenizer) {
 		return token;
 	}
 	
+	if (is_alpha(*p) || *p == '_') {
+		
+		while (is_alpha(*p) || *p == '_' || is_digit(*p)) {p += 1;}
+		
+		token.text.count = (u64)p - (u64)token.text.data;
+		token.kind = TOKEN_KIND_IDENTIFIER;
+		set_source_position(tokenizer, (u64)p - (u64)ctx->source.data);
+		token.line_num = tokenizer->line_num;
+		token.line_start_pos = tokenizer->last_line_start_pos;
+		return token;
+	}
+	
+	if (is_digit(*p) || (p+1 < end && p[0] == '-' && is_digit(p[1]))) {
+		bool dot = false;
+		bool is_hex = false;
+		bool neg = p[0] == '-';
+		
+		if (neg) p += 1;
+		
+		if (p+2 < ctx->source.data + ctx->source.count && p[0] == '0' && p[1] == 'x' && is_hex_digit(p[2])) {
+			is_hex = true;
+			p += 2;
+		}
+		
+		while (is_digit(*p) || *p == '.' || (is_hex && (*p == 'x' || is_hex_digit(*p)))) {
+			if (*p == '.') {
+				if (!dot && !is_hex) dot = true;
+				else {
+					break;
+				}
+			}
+			p += 1;
+		}
+		if (dot && *(p-1) == '.') {
+			dot = false;
+			p--;
+		}
+		token.text.count = (u64)p - (u64)token.text.data;
+		token.kind = dot ? TOKEN_KIND_FLOAT_LITERAL : TOKEN_KIND_INT_LITERAL;
+		set_source_position(tokenizer, (u64)p - (u64)ctx->source.data);
+		token.line_num = tokenizer->line_num;
+		token.line_start_pos = tokenizer->last_line_start_pos;
+		return token;
+	}
+	
 	if (*p >= TOKEN_ASCII_START && *p < TOKEN_ASCII_END) {
 		token.kind = (Token_Kind)*(p++);
 		token.text.count = (u64)p - (u64)token.text.data;
@@ -1131,7 +1195,7 @@ Token skip_to_match(Token_Context *tokenizer, Token left_token) {
 	} else if (left == '"') {
 		right = '"';
 	} else {
-		assert(false); // unimplemented
+		asserttok(ctx, false, STR("Unimplemented match for this token"), &left_token, 0);
 	}
 	
 	u32 depth = 1;
@@ -1208,6 +1272,12 @@ void prepass_some(Token_Context *tokenizer, Token first) {
 				proc->source_body_size_in_bytes = (u32)(source_body_end - source_body_start);
 			}
 		}
+	} else if (t0.kind == TOKEN_KIND_IDENTIFIER && t1.kind == ':') {
+		*(u64*)persistent_array_push_empty(ctx->global_value_positions) = (u64)t0.text.data - (u64)ctx->source.data;
+		
+		Token next = tok_consume(tokenizer);
+		while (next.kind != ';' && next.kind != TOKEN_KIND_EOF)
+			next = tok_consume(tokenizer);
 	} else {
 		terminate_error(ctx, JAC_RESULT_UNEXPECTED_TOKEN, STR("Unable to determine intent with this token."), &first, 0);
 	}
@@ -1219,9 +1289,9 @@ typedef struct Compile_Proc_Args {
 	Compile_Proc_Context result;
 } Compile_Proc_Args;
 
-Type* resolve_type_name(Compile_Proc_Context *compiler, string name) {
-	for (u64 i = 0; i < persistent_array_count(compiler->type_table); i += 1) {
-		Type *t = compiler->type_table + i;
+Type* resolve_type_name(Type *type_table, string name) {
+	for (u64 i = 0; i < persistent_array_count(type_table); i += 1) {
+		Type *t = type_table + i;
 		
 		if (strings_match(t->name, name)) {
 			return t;
@@ -1230,15 +1300,15 @@ Type* resolve_type_name(Compile_Proc_Context *compiler, string name) {
 	return 0;
 }
 
-Type *parse_type(Compile_Proc_Context *compiler) {
-	Token_Context *tokenizer = compiler->tokenizer;
-
+Type *parse_type(Token_Context *tokenizer, Type *type_table) {
+	Jac_Context *ctx = tokenizer->ctx;
+	
 	Token next = tok_consume(tokenizer);
 
 	if (next.kind == TOKEN_KIND_IDENTIFIER) {
-		Type *t = resolve_type_name(compiler, next.text);
+		Type *t = resolve_type_name(type_table, next.text);
 		if (!t) {
-			terminate_error(compiler->ctx, JAC_RESULT_UNRESOLVED_TYPE, STR("There is no type with this name"), &next, 0);
+			terminate_error(ctx, JAC_RESULT_UNRESOLVED_TYPE, STR("There is no type with this name"), &next, 0);
 		}
 		return t;
 	} else if (next.kind == '[') {
@@ -1247,10 +1317,10 @@ Type *parse_type(Compile_Proc_Context *compiler) {
 		
 		if (next.kind == ']') {
 			
-			Type *sub_type = parse_type(compiler);
+			Type *sub_type = parse_type(tokenizer, type_table);
 			
 			if (!sub_type->_sliceified) {
-				sub_type->_sliceified = (Type*)persistent_array_push_empty(compiler->type_table);
+				sub_type->_sliceified = (Type*)persistent_array_push_empty(type_table);
 				sub_type->_sliceified->kind = TYPE_SLICE;
 				sub_type->_sliceified->size = 16;
 				sub_type->_sliceified->name = tprint("[]%s", sub_type->name);
@@ -1260,39 +1330,43 @@ Type *parse_type(Compile_Proc_Context *compiler) {
 			return sub_type->_sliceified;
 			
 		} else {
-			assert(false); // array not implemented, (const expr parse)
+			asserttok(ctx, false, STR("Unimplemented"), &next, 0);
 		}
 	} else {
-		terminate_error(compiler->ctx, JAC_RESULT_UNEXPECTED_TOKEN, STR("Unexpected token. Expected a Type."), &next, 0);
+		terminate_error(ctx, JAC_RESULT_UNEXPECTED_TOKEN, STR("Unexpected token. Expected a Type."), &next, 0);
 	}
 	
-	assert(false);
+	asserttok(ctx, false, STR("Unimplemented"), &next, 0);
 	return 0;
 }
 
-Value_Name* parse_value_declaration(Compile_Proc_Context *compiler, Token first) {
-	Token_Context *tokenizer = compiler->tokenizer;
-	Jac_Context *ctx = compiler->ctx;
+Value_Name* parse_value_declaration(Token_Context *tokenizer, Value_Name *value_table, Type *type_table, Token first) {
+	Jac_Context *ctx = tokenizer->ctx;
 	(void)ctx;
 	
-	assert(first.kind == TOKEN_KIND_IDENTIFIER);
-	Value_Name *name = (Value_Name *)persistent_array_push_empty(compiler->value_table);
-	assert(name);
+	asserttok(ctx, first.kind == TOKEN_KIND_IDENTIFIER, STR("First token must be identifier when calling parse_value_declaration"), &first, 0);
+	
+	Value_Name *name = (Value_Name *)persistent_array_push_empty(value_table);
+	asserttok(ctx, name != 0, STR("Persistent array out of memory"), &first, 0);
 	name->name = first.text;
 		
 	
 	tok_expect(tokenizer, ':');
 	
-	Type *type = parse_type(compiler);
+	Type *type = parse_type(tokenizer, type_table);
 	
 	//logs(JAC_LOG_TRACE, tprint_token(ctx, first, tprint("Value declaration of type %s", type->name)));
 	
 	name->type = type;
-	name->value.vnum = sys_atomic_add_32(&ctx->next_vnum, 1);
 	if (type->kind == TYPE_FLOAT) {
-		name->value.flags |= VALUE_FLOAT;
+		if (type->size == 4)
+			name->value.flags |= VALUE_FLOAT32;
+		else if (type->size == 8)
+			name->value.flags |= VALUE_FLOAT64;
+		else asserttok(ctx, false, STR("Unimplemented"), &first, 0);
 	}
 	name->value.width = type->register_width;
+	name->value.vnum = sys_atomic_add_32(&ctx->next_vnum, name->value.width);
 	
 	
 	return name;
@@ -1316,7 +1390,7 @@ Procedure_Header parse_procedure_header(Compile_Proc_Context *compiler, Token fi
 			terminate_error(ctx, JAC_RESULT_UNEXPECTED_TOKEN, STR("Unexpected token. Expected a parameter declaration, got this."), &next, 0);
 		}
 		
-		parse_value_declaration(compiler, next);
+		parse_value_declaration(tokenizer, compiler->value_table, compiler->type_table, next);
 		header.param_count += 1;
 		
 		tok_expect(tokenizer, ';');
@@ -1327,7 +1401,7 @@ Procedure_Header parse_procedure_header(Compile_Proc_Context *compiler, Token fi
 	if (next.kind == TOKEN_KIND_RIGHT_ARROW) {
 		tok_consume(tokenizer); // ->
 		
-		header.return_type = parse_type(compiler);
+		header.return_type = parse_type(tokenizer, compiler->type_table);
 		next = tok_peek(tokenizer);
 	}
 	
@@ -1353,43 +1427,48 @@ bool can_be_op_token(Token_Kind kind) {
 bool attempt_implicit_cast(Compile_Proc_Context *compiler, Type *from, Type *to, Value val, Value *result) {
 	Jac_Context *ctx = compiler->ctx;
 	
-	if (from == to) {
+	if (from->id == to->id) {
 		*result = val;
 		return true;
 	}
 	
 	if (from->kind == TYPE_LITERAL_INT && to->kind == TYPE_INT) {
+		assert(!(val.flags & VALUE_CODE_RESULT));
 		*result = val;
 		return true;
 	}
 	if (from->kind == TYPE_LITERAL_INT && to->kind == TYPE_FLOAT) {
+		assert(!(val.flags & VALUE_CODE_RESULT));
 		*result = val;
 		u64 int_val = val.imp.literal;
 		result->imp.literal = 0;
 		if (to->size == 4) {
 			float32 f32_val = (float32)int_val;
 			memcpy(&result->imp.literal, &f32_val, sizeof(float32));
-			result->flags = VALUE_FLOAT32 | VALUE_LITERAL;
+			result->flags = (val.flags) | VALUE_FLOAT32 | VALUE_LITERAL;
 			return true;
-		} else if (to->size == 4) {
+		} else if (to->size == 8) {
 			float64 f64_val = (float64)int_val;
 			memcpy(&result->imp.literal, &f64_val, sizeof(float64));
-			result->flags = VALUE_FLOAT64 | VALUE_LITERAL;
+			result->flags = (val.flags) | VALUE_FLOAT64 | VALUE_LITERAL;
 			return true;
 		} else assert(false);
 	}
 	
 	if (from->kind == TYPE_LITERAL_FLOAT && to->kind == TYPE_FLOAT) {
+		assert(!(val.flags & VALUE_CODE_RESULT));
 		*result = val;
 		u64 int_val = val.imp.literal;
 		result->imp.literal = 0;
 		if (to->size == 4) {
 			float32 f32_val = (float32)(*(float64*)&int_val);
 			memcpy(&result->imp.literal, &f32_val, sizeof(float32));
+			result->flags = (val.flags) | VALUE_LITERAL | VALUE_FLOAT32;
 			return true;
-		} else if (to->size == 4) {
+		} else if (to->size == 8) {
 			float64 f64_val = *(float64*)&int_val;
 			memcpy(&result->imp.literal, &f64_val, sizeof(float64));
+			result->flags = (val.flags) | VALUE_LITERAL | VALUE_FLOAT64;
 			return true;
 		} else assert(false);
 	}
@@ -1397,13 +1476,18 @@ bool attempt_implicit_cast(Compile_Proc_Context *compiler, Type *from, Type *to,
 	if (from->kind == TYPE_LITERAL_STRING && to->kind == TYPE_SLICE && to->val.type_slice.elem_type->kind == TYPE_INT && to->val.type_slice.elem_type->size == 1 && !to->val.type_slice.elem_type->val.type_int.is_signed) {
 		result->flags = VALUE_SLICE;
 		result->width = 2;
-		result->vnum = sys_atomic_add_32(&ctx->next_vnum, 1);
+		result->vnum = sys_atomic_add_32(&ctx->next_vnum, 2);
 		
 		Code_Node_Get_String_Slice *n = arena_push(&compiler->node_arena, sizeof(Code_Node_Get_String_Slice));
 		*n = (Code_Node_Get_String_Slice){0};
 		n->base.kind = CODE_NODE_GET_STRING_SLICE;
 		n->str = val.imp.str;
 		n->dst = *result;
+		
+		result->flags |= VALUE_CODE_RESULT;
+		result->imp.code = &n->base;
+		
+		persistent_array_push_copy(compiler->set_table, &n);
 		
 		return true;
 	}
@@ -1415,7 +1499,7 @@ bool attempt_validate_or_promote_operands(Compile_Proc_Context *compiler, Type *
 	*lresult = lval;
 	*rresult = rval;
 	
-	if (ltype == rtype) {
+	if (ltype->id == rtype->id) {
 		*result_type = ltype;
 		return true;
 	}
@@ -1475,6 +1559,7 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 		expr.is_storage = false;
 		expr.type = &ctx->type_literal_float;
 		expr.t1 = first;
+		expr.flags = EXPRESSION_LITERAL;
 	} else if (first.kind == TOKEN_KIND_INT_LITERAL) {
 		expr.value.flags = VALUE_LITERAL;
 		expr.value.width = 1;
@@ -1485,6 +1570,7 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 		expr.is_storage = false;
 		expr.type = &ctx->type_literal_int;
 		expr.t1 = first;
+		expr.flags = EXPRESSION_LITERAL;
 	} else if (first.kind == TOKEN_KIND_STRING_LITERAL) {
 		expr.value.flags = VALUE_LITERAL | VALUE_STRING;
 		expr.value.width = 1;
@@ -1492,6 +1578,7 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 		expr.is_storage = false;
 		expr.type = &ctx->type_literal_string;
 		expr.t1 = first;
+		expr.flags = EXPRESSION_LITERAL;
 	} else if (first.kind == '(') {
 		expr = compile_expression(compiler, tok_consume(tokenizer));
 		tok_expect(tokenizer, ')');
@@ -1522,6 +1609,7 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 			}
 			
 			expr.t1 = next;
+			expr.flags |= EXPRESSION_PROCEDURE_CALL;
 			
 			u64 my_pos = tokenizer->source_pos;
 			
@@ -1541,6 +1629,7 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 			
 			u64 value_count_before = persistent_array_count(compiler->value_table);
 			set_source_position(tokenizer, proc_ref->source_header_start);
+			Value_Name *first_param = compiler->value_table + persistent_array_count(compiler->value_table);
 			Procedure_Header header = parse_procedure_header(compiler, tok_consume(tokenizer));
 			
 			assert(persistent_array_count(compiler->value_table) == value_count_before + header.param_count);
@@ -1563,52 +1652,127 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 			// Reset value table (because we parsed paramters when parsing the procedure header)
 			persistent_array_set_count(compiler->value_table, value_count_before);
 			
-			/*bool call_site_inline = tok_peek(tokenizer).kind == TOKEN_KIND_DIRECTIVE_INLINE;
+			bool call_site_inline = tok_peek(tokenizer).kind == TOKEN_KIND_DIRECTIVE_INLINE;
 			
-			if (call_site_inline || (header.trait_flags & PROCEDURE_TRAIT_INLINE) || proc_ref->source_body_size_in_bytes < 2000) {
+			bool want_inline = 
+				proc_ref // We can only inline if the procedure is defined by us (we can see the source)
+			 && ctx->config.inline_mode != JAC_INLINE_NEVER  // We can't inline if user specified no inlining
+			 && !(header.trait_flags & PROCEDURE_TRAIT_COMPILER) // Cannot inline procedure without body in source
+			 && 
+			 (
+			 	 // Explicit inlining allowed and call site was explicitly  marked as inline
+				 (ctx->config.inline_mode >= JAC_INLINE_EXPLICIT && call_site_inline)
+			 	 // Explicit inlining allowed and procedure was defined with the inline trait
+			  || (ctx->config.inline_mode >= JAC_INLINE_EXPLICIT && (header.trait_flags & PROCEDURE_TRAIT_INLINE))
+			 	 // Inlining small procedures allowed, and procedure source size is lower than an arbitrary heuristic
+			  || (ctx->config.inline_mode >= JAC_INLINE_SMALL_PROCEDURES && proc_ref->source_body_size_in_bytes < 2000)
+			 	 // User specified that everything should be inlined where possible
+			  || (ctx->config.inline_mode == JAC_INLINE_ALL)
+			 );
+			
+			
+			
+			if (want_inline) {
 				if (call_site_inline) tok_consume(tokenizer);
 				
+				expr.flags |= EXPRESSION_INLINED_PROCEDURE_CALL;
 				
-			}*/
-			
-			Code_Node_Call *call = arena_push(&compiler->node_arena, sizeof(Code_Node_Call) + sizeof(Value)*arg_count);
-			*call = (Code_Node_Call){0};
-			call->base.kind = CODE_NODE_CALL;
-			call->arg_count = arg_count;
-			call->symbol = proc_ref->name;
-			for (u64 i = 0; i < arg_count; i += 1) {
-				call->args[i] = args[i].value;
-				if (args[i].value.flags & VALUE_CODE_RESULT) {
-					add_code_dependency(compiler, &call->base, args[i].value.imp.code);
+				bool was_inlining = compiler->state_flags & COMPILE_STATE_INLINING;
+				Value last_inline_return_val = compiler->inline_return_val;
+				u64 old_value_table_count = persistent_array_count(compiler->value_table);
+				Value_Name *old_value_table = PushTempBuffer(Value_Name, old_value_table_count);
+				memcpy(old_value_table, compiler->value_table, old_value_table_count*sizeof(*compiler->value_table));
+				
+				compiler->state_flags |= COMPILE_STATE_INLINING;
+				persistent_array_set_count(compiler->value_table, persistent_array_count(ctx->global_value_table));
+				
+				u64 last_source_position = tokenizer->source_pos;
+				
+				for (u64 i = 0; i < arg_count; i += 1) {
+					(first_param + i)->value = args[i].value;
+					
+					// Push the param value names
+					persistent_array_push_copy(compiler->value_table, (first_param + i));
 				}
+				
+				set_source_position(tokenizer, proc_ref->source_header_start + proc_ref->source_body_offset);
+				
+				void compile_scope(Compile_Proc_Context *compiler, Token first);
+				compile_scope(compiler, tok_consume(tokenizer));
+				
+				expr.value = compiler->inline_return_val;
+				if (header.return_type) {
+					expr.type = header.return_type;
+					expr.is_storage = false;
+				} else {
+					expr.value.width = 0;
+					expr.value.flags |= VALUE_NOTHING;
+					expr.is_storage = false;
+					expr.type = &ctx->type_nothing;
+				}
+				
+				
+				if (!was_inlining) {
+					compiler->state_flags &= ~(COMPILE_STATE_INLINING);
+					compiler->inline_return_val = last_inline_return_val;
+				} else {
+					compiler->inline_return_val = (Value){0};
+				}
+				
+				// Jump back to where we were
+				set_source_position(tokenizer, last_source_position);
+				
+				persistent_array_set_count(compiler->value_table, old_value_table_count);
+				memcpy(compiler->value_table, old_value_table, old_value_table_count*sizeof(*compiler->value_table));
+				
+			} else {
+				Code_Node_Call *call = arena_push(&compiler->node_arena, sizeof(Code_Node_Call) + sizeof(Value)*arg_count);
+				*call = (Code_Node_Call){0};
+				call->base.kind = CODE_NODE_CALL;
+				call->arg_count = arg_count;
+				call->symbol = proc_ref->name;
+				for (u64 i = 0; i < arg_count; i += 1) {
+					call->args[i] = args[i].value;
+					if (args[i].value.flags & VALUE_CODE_RESULT) {
+						add_code_dependency(compiler, &call->base, args[i].value.imp.code);
+					}
+					if (args[i].name) {
+						add_code_dependency_on_value_sets(compiler, &call->base, args[i].name);
+					}
+				}
+				
+				
+				if (header.return_type) {
+					expr.value.width = header.return_type->register_width;
+					expr.value.flags |= VALUE_CODE_RESULT;
+					expr.value.imp.code = &call->base;
+					expr.value.vnum = sys_atomic_add_32(&ctx->next_vnum, header.return_type->register_width);
+					call->dst = expr.value;
+					
+					expr.type = header.return_type;
+					expr.is_storage = false;
+				} else {
+					expr.value.width = 0;
+					expr.value.flags |= VALUE_NOTHING;
+					expr.is_storage = false;
+					expr.type = &ctx->type_nothing;
+				}
+				
+				persistent_array_push_copy(compiler->consequential_nodes, &call);
 			}
 			
-		
-			if (header.return_type) {
-				expr.value.width = header.return_type->register_width;
-				expr.value.flags = VALUE_CODE_RESULT;
-				expr.value.imp.code = &call->base;
-				expr.value.vnum = sys_atomic_add_32(&ctx->next_vnum, 1);
-				
-				expr.type = header.return_type;
-				expr.is_storage = false;
-			} else {
-				expr.value.width = 0;
-				expr.value.flags = VALUE_NOTHING;
-				expr.is_storage = false;
-				expr.type = &ctx->type_nothing;
-			}
 		} else {
 			// Value name
 			
 			bool match = false;
-			for (u64 i = 0; i < persistent_array_count(compiler->value_table); i += 1) {
+			for (s64 i = (s64)persistent_array_count(compiler->value_table)-1; i >= 0; i -= 1) {
 				Value_Name *v = compiler->value_table + i;
 				
 				if (strings_match(v->name, first.text)) {
 					expr.value = v->value;
 					expr.type = v->type;
 					expr.is_storage = v->kind == VALUE_NAME_VARIABLE; // @value_storage_evaluation
+					expr.name = v;
 					match = true;
 					break;
 				}
@@ -1628,137 +1792,97 @@ Expression compile_one_expression(Compile_Proc_Context *compiler, Token first) {
 	return expr;
 }
 
-Expression compile_expression(Compile_Proc_Context *compiler, Token first) {
+typedef struct Compile_Expression_Context {
+	Op_Kind op_stack[256];
+	u64 op_count;
+	Expression expr_stack[256];
+	u64 expr_count;
+} Compile_Expression_Context;
+void pop_expr_stack(Compile_Proc_Context *compiler, Compile_Expression_Context *expr_ctx) {
 
-	Token_Context *tokenizer = compiler->tokenizer;
 	Jac_Context *ctx = compiler->ctx;
 
-	Op_Kind op_stack[256] = {0};
-	u64 op_count = 0;
-	Expression expr_stack[256] = {0};
-	u64 expr_count = 0;
+	Op_Kind lop = expr_ctx->op_stack[expr_ctx->op_count-1];
+	assert(expr_ctx->expr_count >= 2);
+	Expression rexpr = expr_ctx->expr_stack[--expr_ctx->expr_count];
+	Expression lexpr = expr_ctx->expr_stack[--expr_ctx->expr_count];
 	
-	expr_stack[expr_count++] = compile_one_expression(compiler, first);
+	Value rvalue = (Value){0};
+	Value lvalue = (Value){0};
+	Type *op_type = 0;
 	
-	while (can_be_op_token(tok_peek(tokenizer).kind)) {
-		Token rop_tok = tok_consume(tokenizer);
-		Op_Kind rop = get_op_from_token(rop_tok.kind);
-		u64 rprec = get_op_precedence(rop);
-		
-		while (op_count > 0) {
-			Op_Kind lop = op_stack[op_count-1];
-			u64 lprec = get_op_precedence(lop);
-			
-			if (lprec > rprec) {
-				assert(expr_count >= 2);
-				Expression rexpr = expr_stack[--expr_count];
-				Expression lexpr = expr_stack[--expr_count];
-				
-				Value lvalue;
-				Value rvalue;
-				Type *op_type;
-				
-				if (!attempt_validate_or_promote_operands(compiler, lexpr.type, rexpr.type, lexpr.value, rexpr.value, &lvalue, &rvalue, &op_type)) {
-					string s0 = tprint_tokens(ctx, lexpr.t0, lexpr.t1, STR("...This is the LEFT operand"));
-					string s1 = tprint_tokens(ctx, rexpr.t0, rexpr.t1, STR("...This is the RIGHT operand"));
-					string s = tprint("%s%s", s0, s1);
-					terminate_error_with_extra_text_at_the_end(ctx, JAC_RESULT_BAD_IMPLICIT_CONVERSION, tprint("Cannot perform this operation on lhs type '%s' and rhs type '%s'", lexpr.type->name, rexpr.type->name), &lexpr.t0, &rexpr.t1, s);
-				}
-				
-				op_count -= 1; // pop lop
-				
-				Code_Node_Op *code_op = arena_push(&compiler->node_arena, sizeof(Code_Node_Op));
-				*code_op = (Code_Node_Op){0};
-				code_op->left = lvalue;
-				code_op->right = rvalue;
-				code_op->dst.flags = VALUE_CODE_RESULT;
-				code_op->dst.vnum = sys_atomic_add_32(&ctx->next_vnum, 1);
-				if (rexpr.type->kind == TYPE_FLOAT) {
-					if (rexpr.type->size == 4) {
-						code_op->dst.flags |= VALUE_FLOAT32;
-					} else if (rexpr.type->size == 8) {
-						code_op->dst.flags |= VALUE_FLOAT64;
-					} else assert(false);
-				}
-				code_op->dst.imp.code = &code_op->base;
-				
-				switch (lop) {
-					case OP_ADD:
-						code_op->base.kind = CODE_NODE_OP_ADD;
-						break;
-					case OP_SUB:
-						code_op->base.kind = CODE_NODE_OP_SUB;
-						break;
-					case OP_MUL:
-						code_op->base.kind = CODE_NODE_OP_MUL;
-						break;
-					case OP_DIV:
-						code_op->base.kind = CODE_NODE_OP_DIV;
-						break;
-					
-					default: assert(false); break;
-				}
-				
-				// Op expr
-				Expression op_expr = (Expression){0};
-				op_expr.value = code_op->dst;
-				op_expr.type = op_type;
-				op_expr.t0 = lexpr.t0;
-				op_expr.t1 = rexpr.t1;
-				op_expr.is_storage = false;
-				
-				expr_stack[expr_count++] = op_expr;
-				
-				if (lexpr.name) {
-					
-				}
-				
-				if (rexpr.name) {
-					
-				}
-			} else {
-				break;
-			}
-		}
-		
-		Expression rexpr = compile_one_expression(compiler, tok_consume(tokenizer));
-		
-		if (op_count >= 256) {
-			terminate_error(ctx, JAC_RESULT_LIMITATION, STR("This expression has too many operations. Maximum is 256."), &rop_tok, 0);
-		}
-		if (expr_count >= 256) {
-			terminate_error(ctx, JAC_RESULT_LIMITATION, STR("This expression has too many sub-expressions. Maximum is 256."), &rop_tok, 0);
-		}
-		op_stack[op_count++] = rop;
-		expr_stack[expr_count++] = rexpr;
+	if (!attempt_validate_or_promote_operands(compiler, lexpr.type, rexpr.type, lexpr.value, rexpr.value, &lvalue, &rvalue, &op_type)) {
+		string s0 = tprint_tokens(ctx, lexpr.t0, lexpr.t1, STR("...This is the LEFT operand"));
+		string s1 = tprint_tokens(ctx, rexpr.t0, rexpr.t1, STR("...This is the RIGHT operand"));
+		string s = tprint("%s%s", s0, s1);
+		terminate_error_with_extra_text_at_the_end(ctx, JAC_RESULT_BAD_IMPLICIT_CONVERSION, tprint("Cannot perform this operation on lhs type '%s' and rhs type '%s'", lexpr.type->name, rexpr.type->name), &lexpr.t0, &rexpr.t1, s);
 	}
 	
-	// Clear stack
-	while (op_count > 0) {
-		Op_Kind lop = op_stack[op_count-1];
-		assert(expr_count >= 2);
-		Expression rexpr = expr_stack[--expr_count];
-		Expression lexpr = expr_stack[--expr_count];
+	expr_ctx->op_count -= 1; // pop lop
+	
+	if ((lvalue.flags & VALUE_LITERAL) && (rvalue.flags & VALUE_LITERAL)) {
+		assert((lvalue.flags & VALUE_STRING) == 0 && (rvalue.flags & VALUE_STRING) == 0);
 		
-		Value rvalue = (Value){0};
-		Value lvalue = (Value){0};
-		Type *op_type = 0;
+		// todo(charlie) this is a hacky way to do this and will break with large numbers. Should do something better.
 		
-		if (!attempt_validate_or_promote_operands(compiler, lexpr.type, rexpr.type, lexpr.value, rexpr.value, &lvalue, &rvalue, &op_type)) {
-			string s0 = tprint_tokens(ctx, lexpr.t0, lexpr.t1, STR("...This is the LEFT operand"));
-			string s1 = tprint_tokens(ctx, rexpr.t0, rexpr.t1, STR("...This is the RIGHT operand"));
-			string s = tprint("%s%s", s0, s1);
-			terminate_error_with_extra_text_at_the_end(ctx, JAC_RESULT_BAD_IMPLICIT_CONVERSION, tprint("Cannot perform this operation on lhs type '%s' and rhs type '%s'", lexpr.type->name, rexpr.type->name), &lexpr.t0, &rexpr.t1, s);
+		u64 lu64 = lvalue.imp.literal;
+		u64 ru64 = rvalue.imp.literal;
+		u64 resultu64 = 0;
+		f32 lf32 = *(f32*)&lvalue.imp.literal;
+		f32 rf32 = *(f32*)&rvalue.imp.literal;
+		f32 resultf32 = 0.0;
+		f64 lf64 = *(f64*)&lvalue.imp.literal;
+		f64 rf64 = *(f64*)&rvalue.imp.literal;
+		f64 resultf64 = 0.0;
+		
+		
+		
+		#define DO_OPS(LEFT, RIGHT, RES)\
+		switch (lop) { \
+			case OP_ADD: RES = LEFT + RIGHT; break;\
+			case OP_SUB: RES = LEFT - RIGHT; break;\
+			case OP_MUL: RES = LEFT * RIGHT; break;\
+			case OP_DIV: RES = LEFT / RIGHT; break;\
+			\
+			default: assert(false); break;\
 		}
 		
-		op_count -= 1; // pop lop
+		if (op_type->kind == TYPE_LITERAL_INT) {
+			DO_OPS(lu64, ru64, resultu64)
+			lvalue.imp.literal = resultu64;
+		} else if (op_type->kind == TYPE_LITERAL_FLOAT) {
+			if (op_type->size == 4) {
+				DO_OPS(lf32, rf32, resultf32)
+				lvalue.imp.literal = 0;
+				memcpy(&lvalue.imp.literal, &resultf32, 4);
+			} else if (op_type->size == 8) {
+				DO_OPS(lf64, rf64, resultf64)
+				lvalue.imp.literal = *(u64*)&resultf64;
+			} else assert(false);
+		} else assert(false);
 		
+		#undef DO_OPS
+		
+		
+		Expression combined_literal = (Expression){0};
+		combined_literal.type = op_type;
+		combined_literal.value = lvalue;
+		combined_literal.t0 = lexpr.t0;
+		combined_literal.t1 = rexpr.t1;
+		combined_literal.is_storage = false;
+		combined_literal.flags = 0;
+		
+		expr_ctx->expr_stack[expr_ctx->expr_count++] = combined_literal;
+		
+	} else {
+	
 		Code_Node_Op *code_op = arena_push(&compiler->node_arena, sizeof(Code_Node_Op));
 		*code_op = (Code_Node_Op){0};
 		code_op->left = lvalue;
 		code_op->right = rvalue;
 		code_op->dst.flags = VALUE_CODE_RESULT;
 		code_op->dst.vnum = sys_atomic_add_32(&ctx->next_vnum, 1);
+		code_op->dst.width = 1;
 		if (rexpr.type->kind == TYPE_FLOAT) {
 			if (rexpr.type->size == 4) {
 				code_op->dst.flags |= VALUE_FLOAT32;
@@ -1791,7 +1915,7 @@ Expression compile_expression(Compile_Proc_Context *compiler, Token first) {
 		if (rvalue.flags & VALUE_CODE_RESULT) {
 			add_code_dependency(compiler, &code_op->base, rvalue.imp.code);
 		}
-		
+	
 		// Op expr
 		Expression op_expr = (Expression){0};
 		op_expr.type = op_type;
@@ -1799,12 +1923,65 @@ Expression compile_expression(Compile_Proc_Context *compiler, Token first) {
 		op_expr.t0 = lexpr.t0;
 		op_expr.t1 = rexpr.t1;
 		op_expr.is_storage = false;
+		op_expr.flags = EXPRESSION_OP;
 		
-		expr_stack[expr_count++] = op_expr;
+		if (lexpr.name) {
+			add_code_dependency_on_value_sets(compiler, &code_op->base, lexpr.name);
+		}
+		
+		if (rexpr.name) {
+			add_code_dependency_on_value_sets(compiler, &code_op->base, rexpr.name);
+		}
+		
+		expr_ctx->expr_stack[expr_ctx->expr_count++] = op_expr;
 	}
 	
-	assert(expr_count == 1);
-	return expr_stack[0];
+	
+}
+Expression compile_expression(Compile_Proc_Context *compiler, Token first) {
+
+	Token_Context *tokenizer = compiler->tokenizer;
+	Jac_Context *ctx = compiler->ctx;
+
+	Compile_Expression_Context _expr_ctx = (Compile_Expression_Context){0};
+	Compile_Expression_Context *expr_ctx = &_expr_ctx;
+	
+	expr_ctx->expr_stack[expr_ctx->expr_count++] = compile_one_expression(compiler, first);
+	
+	while (can_be_op_token(tok_peek(tokenizer).kind)) {
+		Token rop_tok = tok_consume(tokenizer);
+		Op_Kind rop = get_op_from_token(rop_tok.kind);
+		u64 rprec = get_op_precedence(rop);
+		
+		while (expr_ctx->op_count > 0) {
+			Op_Kind lop = expr_ctx->op_stack[expr_ctx->op_count-1];
+			u64 lprec = get_op_precedence(lop);
+			
+			if (lprec > rprec) 
+				pop_expr_stack(compiler, expr_ctx);
+			else 
+				break;
+		}
+		
+		Expression rexpr = compile_one_expression(compiler, tok_consume(tokenizer));
+		
+		if (expr_ctx->op_count >= 256) {
+			terminate_error(ctx, JAC_RESULT_LIMITATION, STR("This expression has too many operations. Maximum is 256."), &rop_tok, 0);
+		}
+		if (expr_ctx->expr_count >= 256) {
+			terminate_error(ctx, JAC_RESULT_LIMITATION, STR("This expression has too many sub-expressions. Maximum is 256."), &rop_tok, 0);
+		}
+		expr_ctx->op_stack[expr_ctx->op_count++] = rop;
+		expr_ctx->expr_stack[expr_ctx->expr_count++] = rexpr;
+	}
+	
+	// Clear stack
+	while (expr_ctx->op_count > 0) {
+		pop_expr_stack(compiler, expr_ctx);
+	}
+	
+	assert(expr_ctx->expr_count == 1);
+	return expr_ctx->expr_stack[0];
 }
 
 void compile_one_statement(Compile_Proc_Context *compiler, Token first) {
@@ -1848,7 +2025,24 @@ void compile_one_statement(Compile_Proc_Context *compiler, Token first) {
 	} else if (first.kind == TOKEN_KIND_KW_WHILE) {
 		assert(false); // @unimplemented
 	} else if (first.kind == TOKEN_KIND_KW_RETURN) {
-		assert(false); // @unimplemented
+	
+		Expression ret_expr = compile_expression(compiler, tok_consume(tokenizer));
+		tok_expect(tokenizer, ';');
+		
+		if (compiler->state_flags & COMPILE_STATE_INLINING) {
+			compiler->inline_return_val = ret_expr.value;
+		} else {
+			Code_Node_Return *ret = arena_push(&compiler->node_arena, sizeof(Code_Node_Return) + sizeof(Value)*1);
+			*ret = (Code_Node_Return){0};
+			ret->base.kind = CODE_NODE_RETURN;
+			ret->count = 1;
+			ret->values[0] = ret_expr.value;
+			if (ret_expr.value.flags & VALUE_CODE_RESULT)
+				add_code_dependency(compiler, &ret->base, ret_expr.value.imp.code);
+			
+			persistent_array_push_copy(compiler->consequential_nodes, &ret);
+		}
+		
 	} else if (first.kind == TOKEN_KIND_KW_DEFER) {
 		assert(false); // @unimplemented
 	} else if (first.kind == TOKEN_KIND_KW_BREAK) {
@@ -1856,7 +2050,7 @@ void compile_one_statement(Compile_Proc_Context *compiler, Token first) {
 	} else if (first.kind == TOKEN_KIND_KW_CONTINUE) {
 		assert(false); // @unimplemented
 	} else if (first.kind == TOKEN_KIND_IDENTIFIER && next.kind == ':') {
-		Value_Name *val = parse_value_declaration(compiler, first);
+		Value_Name *val = parse_value_declaration(tokenizer, compiler->value_table, compiler->type_table, first);
 		val->first_set = 0;
 		
 		next = tok_peek(tokenizer);
@@ -1871,18 +2065,29 @@ void compile_one_statement(Compile_Proc_Context *compiler, Token first) {
 				terminate_error(ctx, JAC_RESULT_INVALID_CONVERSION, tprint("Cannot use expression of type '%s' to assign to '%s' of type '%s'", expr.type->name, val->name, val->type->name), &first, &expr.t1);
 			}
 			
-			val->first_set = (Code_Node_Set*)arena_push(&compiler->node_arena, sizeof(Code_Node_Set));
-			*val->first_set = (Code_Node_Set){0};
-			val->first_set->base.kind = CODE_NODE_SET;
-			val->first_set->dst = val->value;
-			val->first_set->src = rvalue;
-			if (rvalue.flags & VALUE_CODE_RESULT) {
-				add_code_dependency(compiler, &val->first_set->base, rvalue.imp.code);
+			if ((expr.flags & (EXPRESSION_PROCEDURE_CALL | EXPRESSION_OP)) != 0) {
+				 val->value.vnum = rvalue.vnum;
+				 assert(rvalue.flags & VALUE_CODE_RESULT);
+			 	 val->first_set = rvalue.imp.code;
+				 add_code_dependency_on_value_sets(compiler, val->first_set, val);
+			 	 persistent_array_push_copy(compiler->set_table, &val->first_set);
+			} else {
+				Code_Node_Set *set = (Code_Node_Set*)arena_push(&compiler->node_arena, sizeof(Code_Node_Set));
+				*set = (Code_Node_Set){0};
+				set->base.kind = CODE_NODE_SET;
+				set->dst = val->value;
+				set->src = rvalue;
+				if (rvalue.flags & VALUE_CODE_RESULT) {
+					add_code_dependency(compiler, &set->base, rvalue.imp.code);
+				}
+				
+				val->first_set = (Code_Node*)set;
+				
+				add_code_dependency_on_value_sets(compiler, val->first_set, val);
+				
+				persistent_array_push_copy(compiler->set_table, &val->first_set);
 			}
 			
-			add_code_dependency_on_value_sets(compiler, val->first_set, val);
-			
-			persistent_array_push_copy(compiler->set_table, &val->first_set);
 		}
 		
 		tok_expect(tokenizer, ';');
@@ -1905,25 +2110,35 @@ void compile_one_statement(Compile_Proc_Context *compiler, Token first) {
 				terminate_error(ctx, JAC_RESULT_INVALID_CONVERSION, tprint("Expression of type '%s' cannot be assigned to expression of type '%s'", rexpr.type->name, expr.type->name), &first, &rexpr.t0);
 			}
 			
-			Code_Node_Set *set = (Code_Node_Set*)arena_push(&compiler->node_arena, sizeof(Code_Node_Set));
-			*set = (Code_Node_Set){0};
-			set->base.kind = CODE_NODE_SET;
-			set->dst = expr.value;
-			set->src = rvalue;
-			
-			if (expr.value.flags & VALUE_CODE_RESULT) {
-				add_code_dependency(compiler, &set->base, expr.value.imp.code);
+			if ((rexpr.flags & EXPRESSION_PROCEDURE_CALL) || (rexpr.flags & EXPRESSION_OP)) {
+				assert(rvalue.flags & VALUE_CODE_RESULT);
+				expr.value.vnum = rvalue.vnum;
+				if (expr.name) {
+					add_code_dependency_on_value_sets(compiler, rvalue.imp.code, expr.name);
+				 	persistent_array_push_copy(compiler->set_table, &rvalue.imp.code);
+				}
+			} else {
+				Code_Node_Set *set = (Code_Node_Set*)arena_push(&compiler->node_arena, sizeof(Code_Node_Set));
+				*set = (Code_Node_Set){0};
+				set->base.kind = CODE_NODE_SET;
+				set->dst = expr.value;
+				set->src = rvalue;
+				
+				if (expr.value.flags & VALUE_CODE_RESULT) {
+					add_code_dependency(compiler, &set->base, expr.value.imp.code);
+				}
+				
+				if (rvalue.flags & VALUE_CODE_RESULT) {
+					add_code_dependency(compiler, &set->base, rvalue.imp.code);
+				}
+				
+				if (expr.name) {
+					add_code_dependency_on_value_sets(compiler, &set->base, expr.name);
+				}
+				
+				persistent_array_push_copy(compiler->set_table, &set);
 			}
 			
-			if (rvalue.flags & VALUE_CODE_RESULT) {
-				add_code_dependency(compiler, &set->base, rvalue.imp.code);
-			}
-			
-			if (expr.name) {
-				add_code_dependency_on_value_sets(compiler, set, expr.name);
-			}
-			
-			persistent_array_push_copy(compiler->set_table, &set);
 		}
 		tok_expect(tokenizer, ';');
 	}
@@ -1977,90 +2192,8 @@ void print_value(Value v) {
 	prints(tprint_value(v));
 }
 
-void fprint_value_c(File_Handle f, Value v) {
-	if (v.flags & VALUE_LITERAL) {
-		if (v.flags & VALUE_STRING) {
-			fprint(f, "\"%s\"", v.imp.str);
-		} else if (v.flags & VALUE_FLOAT32) {
-			f64 val_f32 = *(f32*)&v.imp.literal;
-			fprint(f, "%ff", val_f32);
-		} else if (v.flags & VALUE_FLOAT64) {
-			f64 val_f64 = *(f64*)&v.imp.literal;
-			fprint(f, "%ff", val_f64);
-		} else {
-			u64 val_u64 = v.imp.literal;
-			fprint(f, "%u", val_u64);
-		}
-		
-	} else if (v.flags & VALUE_NOTHING) {
-		fprint(f, "NOTHING");
-	} else {
-		fprint(f, "_%i", v.vnum);
-	}
-}
-
 typedef void(*Visit_Code_Node_Proc)(Code_Node *node, void *ud);
 
-typedef struct Emit_Context {
-	Compile_Proc_Context *compiler;	
-	File_Handle file;
-} Emit_Context;
-
-void emit_code_node_c(Code_Node *node, void *ud) {
-	Emit_Context *emitter = (Emit_Context*)ud;
-	Compile_Proc_Context *compiler = emitter->compiler;
-	Jac_Context *ctx = compiler->ctx;
-	Jac_Config config = ctx->config;
-	
-	switch (node->kind) {
-		
-		case CODE_NODE_SET:    
-			Code_Node_Set *set = (Code_Node_Set*)node;
-			fprint_value_c(set->dst);
-			fprint(f, " = ");
-			fprint_value_c(set->src);
-			fprint(f, ";\n");
-			break;
-		case CODE_NODE_CALL:   
-			Code_Node_Call *call = (Code_Node_Call*)node;
-			fprint(f, "%s()", call->symbol);
-			
-			/*for (u64 i = 0; i < call->arg_count; i += 1) {
-				Value arg = call->args[i];
-				print_value(arg);
-				print("; ");
-			}
-			print("\n");*/
-			
-			break;
-		case CODE_NODE_OP_ADD:
-			string sym = STR("+"); goto OPS;
-		case CODE_NODE_OP_SUB: 
-			sym = STR("-"); goto OPS;
-		case CODE_NODE_OP_MUL: 
-			sym = STR("*"); goto OPS;
-		case CODE_NODE_OP_DIV: 
-			sym = STR("/");
-			OPS:
-			Code_Node_Op *op_add = (Code_Node_Op*)node;
-			print_value(op_add->dst);
-			print(" = ");
-			print_value(op_add->left);
-			print(" %s ", sym);
-			print_value(op_add->right);
-			print("\n");
-			break;
-		case CODE_NODE_GET_STRING_SLICE: 
-			Code_Node_Get_String_Slice *str_slice = (Code_Node_Get_String_Slice*)node;
-			print("[ \"%s\", %u ] -> ", str_slice->str, str_slice->str.count);
-			print_value(str_slice->dst);
-			print("\n");
-			break;
-		
-		case CODE_NODE_NONE: // fallthrough
-		default: assert(false); break;
-	}
-}
 
 void print_code_node(Code_Node *node, void *ud) {
 	(void)ud;
@@ -2075,11 +2208,23 @@ void print_code_node(Code_Node *node, void *ud) {
 			break;
 		case CODE_NODE_CALL:   
 			Code_Node_Call *call = (Code_Node_Call*)node;
-			print("call %s ", call->symbol);
+			print("$%u = call %s ", call->dst.vnum, call->symbol);
 			
 			for (u64 i = 0; i < call->arg_count; i += 1) {
 				Value arg = call->args[i];
 				print_value(arg);
+				print("; ");
+			}
+			print("\n");
+			
+			break;
+		case CODE_NODE_RETURN:   
+			Code_Node_Return *ret = (Code_Node_Return*)node;
+			print("ret ");
+			
+			for (u64 i = 0; i < ret->count; i += 1) {
+				Value val = ret->values[i];
+				print_value(val);
 				print("; ");
 			}
 			print("\n");
@@ -2130,7 +2275,7 @@ void walk_code_node_graph(Code_Node *node, Visit_Code_Node_Proc proc, void *ud) 
 
 	proc(node, ud);
 
-	Code_Dependency *dep_from = &node->deps_from;
+	/*Code_Dependency *dep_from = &node->deps_from;
 	
 	while (1) {
 		if (dep_from->node) {
@@ -2138,19 +2283,20 @@ void walk_code_node_graph(Code_Node *node, Visit_Code_Node_Proc proc, void *ud) 
 		}
 		if (!dep_from->next) break;
 		dep_from = dep_from->next;
-	}
+	}*/
 }
 
 Code_Node *next_code(Code_Node *n) {
 	switch (n->kind) {
-		case CODE_NODE_NONE: // fallthrough
 		case CODE_NODE_SET:    return (Code_Node*)((u8*)n + sizeof(Code_Node_Set));
 		case CODE_NODE_CALL:   return (Code_Node*)((u8*)n + sizeof(Code_Node_Call) + sizeof(Value)*((Code_Node_Call*)n)->arg_count);
+		case CODE_NODE_RETURN:   return (Code_Node*)((u8*)n + sizeof(Code_Node_Return) + sizeof(Value)*((Code_Node_Return*)n)->count);
 		case CODE_NODE_OP_ADD: return (Code_Node*)((u8*)n + sizeof(Code_Node_Op));
 		case CODE_NODE_OP_SUB: return (Code_Node*)((u8*)n + sizeof(Code_Node_Op));
 		case CODE_NODE_OP_MUL: return (Code_Node*)((u8*)n + sizeof(Code_Node_Op));
 		case CODE_NODE_OP_DIV: return (Code_Node*)((u8*)n + sizeof(Code_Node_Op));
 		case CODE_NODE_GET_STRING_SLICE: return (Code_Node*)((u8*)n + sizeof(Code_Node_Get_String_Slice));
+		case CODE_NODE_NONE: // fallthrough
 		default: assert(false); return 0;
 	}
 	return 0;
@@ -2161,6 +2307,141 @@ void reset_code_nodes_graph_for_walking(Code_Node *start, Code_Node *end) {
 	while ((u8*)n < (u8*)end) {
 		n->visited = false;
 		n = next_code(n);
+	}
+}
+
+string tprint_value_c(Value v, u32 n) {
+	if (v.flags & VALUE_LITERAL) {
+		assert(n == 0);
+		if (v.flags & VALUE_STRING) {
+			return tprint("\"%s\"", v.imp.str);
+		} else {
+			f32 val_f32 = *(f32*)&v.imp.literal;
+			f64 val_f64 = *(f64*)&v.imp.literal;
+			u64 val_u64 = *(u64*)&v.imp.literal;
+			if (v.flags & VALUE_FLOAT32)
+				return tprint("%f", val_f32);
+			else if (v.flags & VALUE_FLOAT64)
+				return tprint("%f", val_f64);
+			else
+				return tprint("%u", val_u64);
+		}
+	} else if (v.flags & VALUE_NOTHING) {
+		return tprint("NOTHING");
+	} else {
+		assert(n < v.width);
+		u32 vnum = v.vnum + n;
+		if (v.flags & VALUE_FLOAT32)
+			return tprint("_%i.vf32", vnum);
+		else if (v.flags & VALUE_FLOAT64)
+			return tprint("_%i.vf64", vnum);
+		else
+			return tprint("_%i.vu64", vnum);
+	}
+}
+void emit_code_node_text_c(Code_Node *node, void *ud) {
+	Compile_Proc_Context *compiler = (Compile_Proc_Context*)ud;
+	
+	switch (node->kind) {
+		
+		case CODE_NODE_SET:    
+			Code_Node_Set *set = (Code_Node_Set*)node;
+			
+			assert(set->dst.width == set->src.width);
+			assert(set->dst.width == set->src.width);
+			
+			for (u32 i = 0; i < set->dst.width; i += 1) {
+				arena_push_string(&compiler->code_arena, tprint_value_c(set->dst, i));
+				arena_push_string(&compiler->code_arena, STR(" = "));
+				arena_push_string(&compiler->code_arena, tprint_value_c(set->src, i));
+				arena_push_string(&compiler->code_arena, STR(";"));
+			}
+			arena_push_string(&compiler->code_arena, STR("\n"));
+			
+			break;
+		case CODE_NODE_CALL:   
+			Code_Node_Call *call = (Code_Node_Call*)node;
+			
+			for (u32 i = 0; i < call->dst.width; i += 1) {
+			
+				arena_push_string(&compiler->code_arena, tprint("rets[%u] = &", i));
+				arena_push_string(&compiler->code_arena, tprint("_%u", call->dst.vnum));
+				arena_push_string(&compiler->code_arena, STR("; "));
+			}
+			
+			u64 narg = 0;
+			for (u64 i = 0; i < call->arg_count; i += 1) {
+				Value arg = call->args[i];
+				for (u32 j = 0; j < arg.width; j += 1) {
+					arena_push_string(&compiler->code_arena, tprint("%s_arg%u", call->symbol, narg));
+						if (arg.flags & VALUE_FLOAT32)
+							arena_push_string(&compiler->code_arena, STR(".vf32"));
+						else if (arg.flags & VALUE_FLOAT64)
+							arena_push_string(&compiler->code_arena, STR(".vf64"));
+						else
+							arena_push_string(&compiler->code_arena, STR(".vu64"));
+					arena_push_string(&compiler->code_arena, STR(" = "));
+					arena_push_string(&compiler->code_arena, tprint_value_c(arg, j));
+					arena_push_string(&compiler->code_arena, STR("; "));
+					
+					narg += 1;
+				}
+			}
+			arena_push_string(&compiler->code_arena, tprint("%s();\n", call->symbol));
+			
+			break;
+		case CODE_NODE_RETURN:
+			Code_Node_Return *ret = (Code_Node_Return*)node;
+			assert(ret->count == 1);
+			
+			Value val = ret->values[0];
+			
+			for (u32 i = 0; i < val.width; i += 1) {
+				arena_push_string(&compiler->code_arena, tprint("rets[%u]", i));
+				if (val.flags & VALUE_FLOAT32)
+					arena_push_string(&compiler->code_arena, STR("->vf32 = "));
+				else if (val.flags & VALUE_FLOAT64)
+					arena_push_string(&compiler->code_arena, STR("->vf64 = "));
+				else
+					arena_push_string(&compiler->code_arena, STR("->vu64 = "));
+				
+				arena_push_string(&compiler->code_arena, tprint_value_c(val, i));
+				arena_push_string(&compiler->code_arena, STR("; "));
+			}
+			
+			arena_push_string(&compiler->code_arena, STR("\n"));
+			
+			break;
+		case CODE_NODE_OP_ADD:
+			string sym = STR("+"); goto OPS;
+		case CODE_NODE_OP_SUB: 
+			sym = STR("-"); goto OPS;
+		case CODE_NODE_OP_MUL: 
+			sym = STR("*"); goto OPS;
+		case CODE_NODE_OP_DIV: 
+			sym = STR("/");
+			OPS:
+			Code_Node_Op *op_add = (Code_Node_Op*)node;
+			assert(op_add->dst.width = 1);
+			assert(op_add->left.width = 1);
+			assert(op_add->right.width = 1);
+			arena_push_string(&compiler->code_arena, tprint_value_c(op_add->dst, 0));
+			arena_push_string(&compiler->code_arena, STR(" = "));
+			arena_push_string(&compiler->code_arena, tprint_value_c(op_add->left, 0));
+			arena_push_string(&compiler->code_arena, tprint(" %s ", sym));
+			arena_push_string(&compiler->code_arena, tprint_value_c(op_add->right, 0));
+			arena_push_string(&compiler->code_arena, STR(";\n"));
+			break;
+		case CODE_NODE_GET_STRING_SLICE: 
+			Code_Node_Get_String_Slice *str_slice = (Code_Node_Get_String_Slice*)node;
+			
+			u32 count = str_slice->dst.vnum+0;
+			u32 ptr = str_slice->dst.vnum+1;
+			arena_push_string(&compiler->code_arena, tprint("_%u.vu64 = %u; _%u.vu64 = (u64)\"%s\";\n", count, str_slice->str.count, ptr, str_slice->str));
+			break;
+		
+		case CODE_NODE_NONE: // fallthrough
+		default: assert(false); break;
 	}
 }
 
@@ -2198,9 +2479,18 @@ s64 compile_proc_thread(Thread *t) {
 	memcpy(compiler->type_table, ctx->global_type_table, sz);
 	
 	persistent_array_init((void**)&compiler->set_table, sizeof(*compiler->set_table));
+	persistent_array_reserve(compiler->set_table, 4096);
 	
 	compiler->node_arena = make_arena(1024ULL*1024ULL*1024ULL*8ULL, 8*1024);
 	compiler->nodes = (Code_Node*)compiler->node_arena.start;
+	
+	compiler->code_arena = make_arena(1024ULL*1024ULL*1024ULL*8ULL, 8*1024);
+	compiler->code = (u8*)compiler->code_arena.start;
+	
+	persistent_array_init((void**)&compiler->consequential_nodes, sizeof(*compiler->consequential_nodes));
+	persistent_array_reserve(compiler->consequential_nodes, 1024);
+	
+	persistent_array_init((void**)&compiler->param_vnums, sizeof(*compiler->param_vnums));
 	
 	compiler->dependencies_arena = make_arena(1024ULL*1024ULL*1024ULL*8ULL, 4*1024);
 	
@@ -2210,31 +2500,27 @@ s64 compile_proc_thread(Thread *t) {
 	assert(ident.kind == TOKEN_KIND_IDENTIFIER);
 	
 	Procedure_Header header = parse_procedure_header(compiler, ident);
-	
+	compiler->param_count = header.param_count;
+	for (u64 i = 0; i < header.param_count; i += 1) {
+		Value_Name *v = &compiler->value_table[persistent_array_count(compiler->value_table) - header.param_count + i];
+		persistent_array_push_copy(compiler->param_vnums, &v->value.vnum);
+	}
 	if (!(header.trait_flags & PROCEDURE_TRAIT_COMPILER)) {
 		compile_scope(compiler, tok_consume(tokenizer));
 	}
 	
-	Emit_Context emitter = (Emit_Context){0};
-	emitter.compiler = compiler;
-	emitter.file = sys_open_file(ctx->config.out_file_path, FILE_OPEN_WRITE | FILE_OPEN_CREATE | FILE_OPEN_RESET);
-	if (!emitter.file) {
-		terminate_error(ctx, JAC_RESULT_CANNOT_OPEN_FILE, tprint("Could not open file '%s' for writing.", ctx->config.out_file_path), 0, 0);
-	}
+	compiler->code = (u8*)compiler->code_arena.start;
 	
-	Code_Node *n = compiler->nodes;
-	while ((u8*)n < (u8*)compiler->node_arena.position) {
-		walk_code_node_graph(n, emit_code_node_c, &emitter);
-		n = next_code(n);
+	for (u64 j = 0; j < persistent_array_count(compiler->consequential_nodes); j += 1) {
+		walk_code_node_graph(compiler->consequential_nodes[j], emit_code_node_text_c, compiler);
 	}
 	reset_code_nodes_graph_for_walking(compiler->nodes, (Code_Node*)compiler->node_arena.position);
 	
-	sys_closE(emitter.file);
-	
-	persistent_array_uninit(compiler->proc_table);
-	persistent_array_uninit(compiler->value_table);
-	persistent_array_uninit(compiler->type_table);
-	persistent_array_uninit(compiler->set_table);
+	//persistent_array_uninit(compiler->proc_table);
+	//persistent_array_uninit(compiler->value_table);
+	//persistent_array_uninit(compiler->type_table);
+	//persistent_array_uninit(compiler->set_table);
+	//persistent_array_uninit(compiler->consequential_nodes); #leak 
 	
 	args->result = _compiler;
 	
@@ -2280,8 +2566,9 @@ s64 jac_compile_thread(Thread *t) {
 	persistent_array_init((void**)&ctx->global_proc_table, sizeof(*ctx->global_proc_table));
 	persistent_array_init((void**)&ctx->global_value_table, sizeof(*ctx->global_value_table));
 	persistent_array_init((void**)&ctx->global_type_table, sizeof(*ctx->global_type_table));
+	persistent_array_init((void**)&ctx->global_value_positions, sizeof(*ctx->global_value_positions));
 	
-	persistent_array_reserve(ctx->global_type_table, 10);
+	persistent_array_reserve(ctx->global_type_table, 20);
 	
 	Type *type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("u8");
@@ -2290,6 +2577,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_u8 = type;
 	type->val.type_int.is_signed = false;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("s8");
@@ -2298,6 +2586,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_s8 = type;
 	type->val.type_int.is_signed = true;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("u16");
@@ -2306,6 +2595,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_u16 = type;
 	type->val.type_int.is_signed = false;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("s16");
@@ -2314,6 +2604,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_s16 = type;
 	type->val.type_int.is_signed = true;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("u32");
@@ -2322,6 +2613,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_u32 = type;
 	type->val.type_int.is_signed = false;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("s32");
@@ -2330,6 +2622,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_s32 = type;
 	type->val.type_int.is_signed = true;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("u64");
@@ -2338,6 +2631,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_u64 = type;
 	type->val.type_int.is_signed = false;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("s64");
@@ -2346,6 +2640,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->register_width = 1;
 	ctx->type_s32 = type;
 	type->val.type_int.is_signed = true;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("f32");
@@ -2353,6 +2648,7 @@ s64 jac_compile_thread(Thread *t) {
 	type->size = sizeof(f32);
 	type->register_width = 1;
 	ctx->type_f32 = type;
+	type->id = ctx->next_type_id++;
 	
 	type = (Type*)persistent_array_push_empty(ctx->global_type_table);
 	type->name = STR("f64");
@@ -2360,22 +2656,27 @@ s64 jac_compile_thread(Thread *t) {
 	type->size = sizeof(f64);
 	type->register_width = 1;
 	ctx->type_f64 = type;
+	type->id = ctx->next_type_id++;
 	
 	ctx->type_literal_float.name = STR("Float Literal");
 	ctx->type_literal_float.kind = TYPE_LITERAL_FLOAT;
 	ctx->type_literal_float.size = 0;
+	ctx->type_literal_float.id = ctx->next_type_id++;
 	
 	ctx->type_literal_int.name = STR("Int Literal");
 	ctx->type_literal_int.kind = TYPE_LITERAL_INT;
 	ctx->type_literal_int.size = 0;
+	ctx->type_literal_int.id = ctx->next_type_id++;
 	
 	ctx->type_literal_string.name = STR("String Literal");
 	ctx->type_literal_string.kind = TYPE_LITERAL_STRING;
 	ctx->type_literal_string.size = 0;
+	ctx->type_literal_string.id = ctx->next_type_id++;
 	
 	ctx->type_nothing.name = STR("Nothing Type");
 	ctx->type_nothing.kind = TYPE_NOTHING;
 	ctx->type_nothing.size = 0;
+	ctx->type_nothing.id = ctx->next_type_id++;
 	
 	ctx->config = args->config;
 	
@@ -2400,6 +2701,13 @@ s64 jac_compile_thread(Thread *t) {
 		///
 		// Parse globals
 		
+		for (u64 i = 0; i < persistent_array_count(ctx->global_value_positions); i += 1) {
+			u64 pos = ctx->global_value_positions[i];
+			
+			set_source_position(tokenizer, pos);
+			parse_value_declaration(tokenizer, ctx->global_value_table, ctx->global_type_table, tok_consume(tokenizer));
+		}
+		
 		///
 		// Compile procedures in parallell
 		
@@ -2422,6 +2730,8 @@ s64 jac_compile_thread(Thread *t) {
 			sys_thread_start(thread);
 		}
 		
+		
+		
 		s64 exit_code = 0;
 		for (u64 i = 0; i < thread_count; i += 1) {
 			Thread *thread = threads + i;
@@ -2436,15 +2746,90 @@ s64 jac_compile_thread(Thread *t) {
 			
 			if (exit_code == 0) {
 				print("Proc %s:\n", a->proc->name);
-				Code_Node *n = a->result.nodes;
-				while ((u8*)n < (u8*)a->result.node_arena.position) {
-					walk_code_node_graph(n, print_code_node, 0);
-					n = next_code(n);
+				for (u64 j = 0; j < persistent_array_count(a->result.consequential_nodes); j += 1) {
+					walk_code_node_graph(a->result.consequential_nodes[j], print_code_node, 0);
 				}
 				reset_code_nodes_graph_for_walking(a->result.nodes, (Code_Node*)a->result.node_arena.position);
+				print("\n");
+				string code_string = (string) { (u64)a->result.code_arena.position-(u64)a->result.code_arena.start, a->result.code };
+				prints(code_string);
 				print("\n\n");
 			}
 		}
+		
+		// Allocate 2 value numbers for output_string
+		ctx->next_vnum += 2;
+		
+		File_Handle f = sys_open_file(ctx->config.out_file_path, FILE_OPEN_WRITE | FILE_OPEN_CREATE | FILE_OPEN_RESET);
+		
+		if (f == 0) {
+			terminate_error(ctx, JAC_RESULT_CANNOT_OPEN_FILE, tprint("Could not open output file '%s' for writing", ctx->config.out_file_path), 0, 0);
+		}
+		
+		sys_write_string(f, STR("#define OSTD_HEADLESS\n"
+                               "#define OSTD_IMPL\n"
+                               "#include \"One-Std/one-headers/one_print.h\"\n"));
+		sys_write_string(f, STR("typedef union Reg { u64 vu64; f64 vf64; f32 vf32; } Reg;\n"));
+		sys_write_string(f, STR("Reg "));
+		for (u32 j = 0; j < ctx->next_vnum; j += 1) {
+			if (j < ctx->next_vnum-1)
+				sys_write_string(f, tprint("_%u, ", j));
+			else
+				sys_write_string(f, tprint("_%u;", j));
+		}
+		sys_write_string(f, STR("Reg *rets[256];\n"));
+		u64 arg0 = ctx->next_vnum-2;
+		u64 arg1 = ctx->next_vnum-1;
+		sys_write_string(f, tprint("#define output_string_arg0 _%u\n", arg0));
+		sys_write_string(f, tprint("#define output_string_arg1 _%u\n", arg1));
+		sys_write_string(f, tprint("int output_string() { string s = (string) { _%u.vu64, (u8*)_%u.vu64 }; prints(s); return 0; }\n", arg0, arg1));
+		
+		for (u64 j = 0; j < persistent_array_count(ctx->global_proc_table); j += 1) {
+			
+			sys_write_string(f, tprint("int %s();", ctx->global_proc_table[j].name));
+		}
+		
+		for (u64 i = 0; i < thread_count; i += 1) {
+			Thread *thread = threads + i;
+			
+			s64 result = sys_thread_join(thread);
+			
+			if (result != 0) {
+				if (exit_code == 0) exit_code = result;
+			}
+			
+			Compile_Proc_Args *a = proc_args + i;
+			
+			if (exit_code == 0 && !strings_match(a->proc->name, STR("output_string"))) {
+				
+				for (u64 j = 0; j < persistent_array_count(a->result.param_vnums); j += 1) {
+					u32 vnum = a->result.param_vnums[j];
+					sys_write_string(f, tprint("\n#define %s_arg%u _%u\n", a->proc->name, j, vnum));
+				}
+			}
+		}
+		
+		for (u64 i = 0; i < thread_count; i += 1) {
+			Thread *thread = threads + i;
+			
+			s64 result = sys_thread_join(thread);
+			
+			if (result != 0) {
+				if (exit_code == 0) exit_code = result;
+			}
+			
+			Compile_Proc_Args *a = proc_args + i;
+			
+			if (exit_code == 0 && !strings_match(a->proc->name, STR("output_string"))) {
+				string code_string = (string) { (u64)a->result.code_arena.position-(u64)a->result.code_arena.start, a->result.code };
+				sys_write_string(f, tprint("\nint %s()\n{\n", a->proc->name));
+				sys_write_string(f, code_string);
+				sys_write_string(f, STR("\nreturn 0;\n}\n"));
+			}
+		}
+		
+		sys_close(f);
+		
 		if (exit_code != 0) {
 			log(JAC_LOG_COMPILE_ERROR, "A procedure failed compiling. Aborted.");
 			sys_exit_current_thread(exit_code);

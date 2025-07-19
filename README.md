@@ -1,0 +1,1 @@
+AST-free, very parallell, proof-of-concept compiler. Compiles to an IR which is currently converted to some machine-code-like C. Inlining supported.
